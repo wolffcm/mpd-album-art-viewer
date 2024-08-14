@@ -1,0 +1,17 @@
+[package]
+name = "mpd-album-art-viewer"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+ansi-to-tui = "5.0.0-rc.1"
+image = "0.24.9"
+image-to-ascii = "0.6.0"
+mpd = "0.1.0"
+ratatui = "0.27.0"
+
+[patch.crates-io]
+mpd = { path = "../../kstep/rust-mpd" }
+image-to-ascii = { path = "../../kpberry/image-to-ascii" }
