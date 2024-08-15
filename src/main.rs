@@ -161,8 +161,8 @@ impl App {
     const ALPHABET: &'static str = include_str!("../alphabets/alphabet.txt");
     const BDF_FILE: &'static str = include_str!("../fonts/bitocra-13.bdf");
 
-    fn img_to_char_rows(&self) -> Result<Option<Vec<Vec<char>>>> {
-        Ok(self.img.as_ref().map(|img| {
+    fn img_to_char_rows(&self) -> Option<Vec<Vec<char>>> {
+        self.img.as_ref().map(|img| {
             let alphabet = Self::ALPHABET.chars().collect::<Vec<char>>();
             let font = Font::from_bdf_stream(Self::BDF_FILE.as_bytes(), &alphabet);
             let luma_img: LumaImage<f32> = LumaImage::from(img);
@@ -174,7 +174,7 @@ impl App {
                 0.0,
                 &get_conversion_algorithm("edge-augmented"),
             )
-        }))
+        })
     }
 
     fn char_rows_to_terminal_color_strings(&self, rows: &[Vec<char>]) -> String {
@@ -196,11 +196,16 @@ impl Widget for &App {
         let block = Block::bordered()
             .title(title.alignment(Alignment::Left))
             .border_set(border::ROUNDED);
-        let char_rows = self.img_to_char_rows().unwrap().unwrap();
-        let terminal_color_strings: Text = self
-            .char_rows_to_terminal_color_strings(&char_rows)
-            .into_text()
-            .unwrap();
+
+        let colored_text = self
+            .img_to_char_rows()
+            .map(|rows| -> Text {
+                self.char_rows_to_terminal_color_strings(&rows)
+                    .into_text()
+                    .unwrap()
+            })
+            .unwrap_or(Text::from("\n\n\nNo image"));
+
         let padding = Padding {
             left: 2,
             right: 2,
@@ -218,7 +223,7 @@ impl Widget for &App {
             height,
         };
 
-        Paragraph::new(terminal_color_strings)
+        Paragraph::new(colored_text)
             .centered()
             .block(block.padding(padding))
             .render(area, buf);
