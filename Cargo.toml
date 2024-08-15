@@ -14,4 +14,4 @@ ratatui = "0.27.0"
 
 [patch.crates-io]
 mpd = { path = "../../kstep/rust-mpd" }
-image-to-ascii = { path = "../../kpberry/image-to-ascii" }
+image-to-ascii = { path = "../image-to-ascii" }
