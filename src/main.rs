@@ -51,9 +51,8 @@ fn main() -> Result<()> {
 #[derive(Default)]
 struct State<'a> {
     current_song: Option<Song>,
-    status: MpdStatus,
+    mpd_status: MpdStatus,
     img: Option<DynamicImage>,
-    ascii_img: Option<String>,
     colored_text: Option<Text<'a>>,
 }
 
@@ -127,7 +126,7 @@ impl App<'_> {
     }
 
     fn update_current_song(&mut self) -> Result<()> {
-        self.state.status = self.client.status()?;
+        self.state.mpd_status = self.client.status()?;
         let song = self.client.currentsong()?;
         let song_changed = match (&song, &self.state.current_song) {
             (None, None) => false,
@@ -182,7 +181,7 @@ impl App<'_> {
     }
 
     fn status_desc(&self) -> String {
-        let status = &self.state.status;
+        let status = &self.state.mpd_status;
         let state = match status.state {
             MpdState::Stop => "Stopped",
             MpdState::Play => "Playing",
@@ -204,7 +203,7 @@ impl App<'_> {
     }
 
     fn convert_img_to_colored_text(&mut self) -> Result<()> {
-        self.state.ascii_img = self.state.img.as_ref().map(|img| {
+        self.state.colored_text = self.state.img.as_ref().map(|img| {
             let rows = convert::img_to_char_rows(
                 &self.font,
                 &LumaImage::from(img),
@@ -216,10 +215,7 @@ impl App<'_> {
             );
 
             convert::char_rows_to_terminal_color_string(&rows, img)
-        });
-        self.state.colored_text = self
-            .state
-            .ascii_img
+        })
             .as_deref()
             .map(|str| str.into_text())
             .transpose()?;
