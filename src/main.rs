@@ -5,8 +5,9 @@ use img_to_ascii::{
     font::Font,
     image::LumaImage,
 };
-use mpd::client::Client as MpdClient;
-use mpd::song::Song;
+use mpd::{
+    client::Client as MpdClient, song::Song, status::State as MpdState, status::Status as MpdStatus,
+};
 use ratatui::{
     backend::CrosstermBackend,
     buffer::Buffer,
@@ -17,16 +18,19 @@ use ratatui::{
     },
     layout::{Alignment, Rect},
     prelude::Backend,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     symbols::border,
     text::{Span, Text},
-    widgets::{block::Title, Block, Padding, Paragraph, Widget},
+    widgets::{
+        block::{Position, Title},
+        Block, Padding, Paragraph, Widget,
+    },
     Frame, Terminal,
 };
+use std::error::Error;
 use std::io::{stdout, Cursor};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
-use std::{error::Error, fs::File};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -44,24 +48,37 @@ fn main() -> Result<()> {
     result
 }
 
-struct App {
-    client: MpdClient,
+#[derive(Default)]
+struct State<'a> {
     current_song: Option<Song>,
+    status: MpdStatus,
     img: Option<DynamicImage>,
+    ascii_img: Option<String>,
+    colored_text: Option<Text<'a>>,
+}
+
+struct App<'a> {
+    client: MpdClient,
+    font: Font,
+    state: State<'a>,
     last_update_time: Option<Instant>,
     exit: bool,
 }
 
-impl App {
+impl App<'_> {
     const UPDATE_PERIOD: Duration = Duration::from_secs(1);
+    const ALPHABET: &'static str = include_str!("../alphabets/alphabet.txt");
+    const BDF_FILE: &'static str = include_str!("../fonts/bitocra-13.bdf");
 
     pub fn create() -> Result<Self> {
         let addr = SocketAddr::from(([127, 0, 0, 1], 6600));
         let client = MpdClient::connect(addr)?;
+        let alphabet = Self::ALPHABET.chars().collect::<Vec<char>>();
+        let font = Font::from_bdf_stream(Self::BDF_FILE.as_bytes(), &alphabet);
         Ok(App {
+            font,
             client,
-            current_song: None,
-            img: None,
+            state: State::default(),
             last_update_time: None,
             exit: false,
         })
@@ -94,7 +111,8 @@ impl App {
                     _ => {}
                 };
             }
-            if self.elapsed_since_update() >= Self::UPDATE_PERIOD && self.update_current_song()? {
+            if self.elapsed_since_update() >= Self::UPDATE_PERIOD {
+                self.update_current_song()?;
                 break;
             }
         }
@@ -108,17 +126,19 @@ impl App {
         }
     }
 
-    fn update_current_song(&mut self) -> Result<bool> {
+    fn update_current_song(&mut self) -> Result<()> {
+        self.state.status = self.client.status()?;
         let song = self.client.currentsong()?;
-        let song_changed = match (&song, &self.current_song) {
+        let song_changed = match (&song, &self.state.current_song) {
             (None, None) => false,
             (Some(song0), Some(song1)) if song0 == song1 => false,
             _ => true,
         };
 
         if song_changed {
-            self.current_song = song;
-            self.img = self
+            self.state.current_song = song;
+            self.state.img = self
+                .state
                 .current_song
                 .as_ref()
                 .map(|song| -> Result<DynamicImage> {
@@ -127,10 +147,11 @@ impl App {
                         .with_guessed_format()?
                         .decode()?)
                 })
-                .transpose()?
+                .transpose()?;
+            self.convert_img_to_colored_text()?;
         }
 
-        Ok(song_changed)
+        Ok(())
     }
 
     fn elapsed_since_update(&self) -> Duration {
@@ -142,7 +163,8 @@ impl App {
     }
 
     fn song_desc(&self) -> String {
-        self.current_song
+        self.state
+            .current_song
             .as_ref()
             .map(|song| {
                 format!(
@@ -154,57 +176,89 @@ impl App {
             .unwrap_or("No song playing".to_owned())
     }
 
+    fn fmt_duration(d: &Duration) -> String {
+        let s = d.as_secs();
+        format!("{:02}:{:02}", s / 60, s % 60)
+    }
+
+    fn status_desc(&self) -> String {
+        let status = &self.state.status;
+        let state = match status.state {
+            MpdState::Stop => "Stopped",
+            MpdState::Play => "Playing",
+            MpdState::Pause => "Paused",
+        };
+        let times = status
+            .time
+            .as_ref()
+            .map(|(current, total)| format!("{} / {}", Self::fmt_duration(current), Self::fmt_duration(total)));
+
+        match times {
+            Some(times) => format!("{} - {}", state, times),
+            None => state.to_string()
+        }
+    }
+
     fn exit(&mut self) {
         self.exit = true;
     }
 
-    const ALPHABET: &'static str = include_str!("../alphabets/alphabet.txt");
-    const BDF_FILE: &'static str = include_str!("../fonts/bitocra-13.bdf");
-
-    fn img_to_char_rows(&self) -> Option<Vec<Vec<char>>> {
-        self.img.as_ref().map(|img| {
-            let alphabet = Self::ALPHABET.chars().collect::<Vec<char>>();
-            let font = Font::from_bdf_stream(Self::BDF_FILE.as_bytes(), &alphabet);
-            let luma_img: LumaImage<f32> = LumaImage::from(img);
-            convert::img_to_char_rows(
-                &font,
-                &luma_img,
+    fn convert_img_to_colored_text(&mut self) -> Result<()> {
+        self.state.ascii_img = self.state.img.as_ref().map(|img| {
+            let rows = convert::img_to_char_rows(
+                &self.font,
+                &LumaImage::from(img),
+                // TODO: store these in App
                 get_converter("direction-and-intensity"),
                 Some(120),
                 0.0,
                 &get_conversion_algorithm("edge-augmented"),
-            )
-        })
-    }
+            );
 
-    fn char_rows_to_terminal_color_strings(&self, rows: &[Vec<char>]) -> String {
-        convert::char_rows_to_terminal_color_string(rows, self.img.as_ref().unwrap())
+            convert::char_rows_to_terminal_color_string(&rows, img)
+        });
+        self.state.colored_text = self
+            .state
+            .ascii_img
+            .as_deref()
+            .map(|str| str.into_text())
+            .transpose()?;
+        Ok(())
     }
 }
 
-impl Widget for &App {
+impl Widget for &App<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let style = Style::default()
             .add_modifier(Modifier::REVERSED)
             .add_modifier(Modifier::BOLD);
-        let title: Vec<Span> = vec![
+        let song_desc: Vec<Span> = vec![
             "".into(),
             Span::styled(self.song_desc(), style),
             "".into(),
         ];
-        let title: Title = title.into();
+        let state_desc: Vec<Span> = vec![
+            "".into(),
+            Span::styled(self.status_desc(), style),
+            "".into(),
+        ];
+        let state_desc: Title = state_desc.into();
+        let state_desc = state_desc
+            .alignment(Alignment::Right)
+            .position(Position::Bottom);
+        let title: Title = song_desc.into();
         let block = Block::bordered()
             .title(title.alignment(Alignment::Left))
+            .title(state_desc)
             .border_set(border::ROUNDED);
 
+        let no_image_text = Text::from("\n\n\nNo image");
         let colored_text = self
-            .img_to_char_rows()
-            .map(|rows| -> Text {
-                self.char_rows_to_terminal_color_strings(&rows)
-                    .into_text()
-                    .unwrap()
-            })
-            .unwrap_or(Text::from("\n\n\nNo image"));
+            .state
+            .colored_text
+            .as_ref()
+            .map(|text| text)
+            .unwrap_or(&no_image_text);
 
         let padding = Padding {
             left: 2,
@@ -223,7 +277,7 @@ impl Widget for &App {
             height,
         };
 
-        Paragraph::new(colored_text)
+        Paragraph::new(colored_text.clone())
             .centered()
             .block(block.padding(padding))
             .render(area, buf);
