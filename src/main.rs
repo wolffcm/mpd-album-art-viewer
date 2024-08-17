@@ -50,7 +50,7 @@ fn main() -> Result<()> {
 
 enum ImgState {
     Idle(Option<(DynamicImage, Text<'static>)>),
-    Converting(JoinHandle<(DynamicImage, Text<'static>)>),
+    Converting(JoinHandle<Option<(DynamicImage, Text<'static>)>>),
 }
 
 impl ImgState {
@@ -82,7 +82,7 @@ impl ImgState {
 
         match jh.join() {
             Err(err) => panic!("{:?}", err),
-            Ok(converted) => *self = ImgState::Idle(Some(converted))
+            Ok(converted) => *self = ImgState::Idle(converted),
         }
     }
 }
@@ -182,16 +182,24 @@ impl App {
 
         if song_changed && self.state.img_state.is_idle() {
             // enter converting state
-            let art = self
-                .client
-                .albumart(self.state.current_song.as_ref().unwrap())?;
+            let art: Option<Vec<u8>> = self
+                .state
+                .current_song
+                .as_ref()
+                .map(|song| -> Option<Vec<u8>> { self.client.albumart(song).ok() })
+                .flatten();
             let font = self.font.clone();
-            let jh = std::thread::spawn(move || -> (DynamicImage, Text<'static>) {
+            let jh = std::thread::spawn(move || -> Option<(DynamicImage, Text<'static>)> {
+                let art = match art {
+                    None => return None,
+                    Some(_art) => _art,
+                };
+
                 let dyn_img = ImageReader::new(Cursor::new(art))
                     .with_guessed_format()
-                    .unwrap()
+                    .ok()?
                     .decode()
-                    .unwrap();
+                    .ok()?;
                 let rows = convert::img_to_char_rows(
                     &font,
                     &LumaImage::from(&dyn_img),
@@ -203,8 +211,8 @@ impl App {
 
                 let text = convert::char_rows_to_terminal_color_string(&rows, &dyn_img)
                     .into_text()
-                    .unwrap();
-                (dyn_img, text)
+                    .ok()?;
+                Some((dyn_img, text))
             });
             self.state.img_state = ImgState::Converting(jh);
         } else if self.state.img_state.is_idle() || self.state.img_state.is_working() {
@@ -270,19 +278,20 @@ impl App {
 
 impl Widget for &App {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let style = Style::default()
+        let title_style = Style::default()
             .add_modifier(Modifier::REVERSED)
             .add_modifier(Modifier::BOLD);
         let song_desc: Vec<Span> = vec![
             "".into(),
-            Span::styled(self.song_desc(), style),
+            Span::styled(self.song_desc(), title_style),
             "".into(),
         ];
         let state_desc: Vec<Span> = vec![
             "".into(),
-            Span::styled(self.status_desc(), style),
+            Span::styled(self.status_desc(), title_style),
             "".into(),
         ];
+
         let state_desc: Title = state_desc.into();
         let state_desc = state_desc
             .alignment(Alignment::Right)
@@ -293,22 +302,25 @@ impl Widget for &App {
             .title(state_desc)
             .border_set(border::ROUNDED);
 
-        let no_image = Text::from("No image");
-        let converting_image = Text::from("Converting image");
+        let no_img_style = Style::default().add_modifier(Modifier::DIM);
+        let no_image: Text<'static> = Span::styled("No image", no_img_style).into();
+        let converting_image: Text<'static> = Span::styled("Converting image", no_img_style).into();
         let colored_text = match &self.state.img_state {
             ImgState::Idle(Some((_, text))) => text,
             ImgState::Idle(None) => &no_image,
             ImgState::Converting(_) => &converting_image,
         };
 
+        let vert_padding: u16 = (62 - std::cmp::min(colored_text.height(), 60) as u16) / 2;
+        let horiz_padding: u16 = (124 - std::cmp::min(colored_text.width(), 120) as u16) / 2;
         let padding = Padding {
-            left: 2,
-            right: 2,
-            top: 1,
-            bottom: 1,
+            left: horiz_padding,
+            right: horiz_padding,
+            top: vert_padding,
+            bottom: vert_padding,
         };
-        let width = 120 + 6;
-        let height = 60 + 4;
+        let width = colored_text.width() as u16 + (padding.left * 2) + 2;
+        let height = colored_text.height() as u16 + (padding.top * 2) + 2;
         let x = (area.width / 2) - (width / 2);
         let y = (area.height / 2) - (height / 2);
         let area = Rect {
