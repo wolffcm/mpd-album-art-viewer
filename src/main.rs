@@ -95,6 +95,7 @@ impl Default for ImgState {
 
 #[derive(Default)]
 struct State {
+    area: Rect,
     current_song: Option<Song>,
     mpd_status: MpdStatus,
     img_state: ImgState,
@@ -128,6 +129,8 @@ impl App {
     }
 
     pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
+        self.state.area = terminal.get_frame().size();
+
         let _ = self.update_app_state()?;
         terminal.draw(|frame| self.render_frame(frame))?;
         while !self.exit {
@@ -189,6 +192,7 @@ impl App {
                 .map(|song| -> Option<Vec<u8>> { self.client.albumart(song).ok() })
                 .flatten();
             let font = self.font.clone();
+            let width = (self.state.area.height as usize - 10) * 2;
             let jh = std::thread::spawn(move || -> Option<(DynamicImage, Text<'static>)> {
                 let art = match art {
                     None => return None,
@@ -204,7 +208,7 @@ impl App {
                     &font,
                     &LumaImage::from(&dyn_img),
                     get_converter("direction-and-intensity"),
-                    Some(120),
+                    Some(width),
                     0.0,
                     &get_conversion_algorithm("edge-augmented"),
                 );
@@ -311,24 +315,23 @@ impl Widget for &App {
             ImgState::Converting(_) => &converting_image,
         };
 
-        let vert_padding: u16 = (62 - std::cmp::min(colored_text.height(), 60) as u16) / 2;
-        let horiz_padding: u16 = (124 - std::cmp::min(colored_text.width(), 120) as u16) / 2;
-        let padding = Padding {
-            left: horiz_padding,
-            right: horiz_padding,
-            top: vert_padding,
-            bottom: vert_padding,
-        };
-        let width = colored_text.width() as u16 + (padding.left * 2) + 2;
-        let height = colored_text.height() as u16 + (padding.top * 2) + 2;
-        let x = (area.width / 2) - (width / 2);
-        let y = (area.height / 2) - (height / 2);
+        let width: u16 = (area.height - 10) * 2;
+        let height: u16 = area.height - 10;
         let area = Rect {
-            x,
-            y,
             width,
             height,
+            x: (area.width - width) / 2,
+            y: (area.height - height) / 2,
         };
+
+        let padding = Padding::symmetric(
+            2,
+            if colored_text.height() > 1 {
+                1
+            } else {
+                height / 2 - 3
+            },
+        );
 
         Paragraph::new(colored_text.clone())
             .centered()
