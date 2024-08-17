@@ -27,10 +27,10 @@ use ratatui::{
     },
     Frame, Terminal,
 };
-use std::error::Error;
 use std::io::{stdout, Cursor};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
+use std::{error::Error, thread::JoinHandle};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -48,23 +48,67 @@ fn main() -> Result<()> {
     result
 }
 
-#[derive(Default)]
-struct State<'a> {
-    current_song: Option<Song>,
-    mpd_status: MpdStatus,
-    img: Option<DynamicImage>,
-    colored_text: Option<Text<'a>>,
+enum ImgState {
+    Idle(Option<(DynamicImage, Text<'static>)>),
+    Converting(JoinHandle<(DynamicImage, Text<'static>)>),
 }
 
-struct App<'a> {
+impl ImgState {
+    fn is_idle(&self) -> bool {
+        match self {
+            ImgState::Idle(_) => true,
+            _ => false,
+        }
+    }
+
+    fn is_working(&self) -> bool {
+        match self {
+            ImgState::Idle(_) => false,
+            ImgState::Converting(jh) => !jh.is_finished(),
+        }
+    }
+
+    fn finish_conversion(&mut self) {
+        let mut tmp = ImgState::default();
+        std::mem::swap(&mut tmp, self);
+
+        let jh = match tmp {
+            ImgState::Idle(_) => panic!("not converting"),
+            ImgState::Converting(jh) => {
+                assert!(jh.is_finished());
+                jh
+            }
+        };
+
+        match jh.join() {
+            Err(err) => panic!("{:?}", err),
+            Ok(converted) => *self = ImgState::Idle(Some(converted))
+        }
+    }
+}
+
+impl Default for ImgState {
+    fn default() -> Self {
+        Self::Idle(None)
+    }
+}
+
+#[derive(Default)]
+struct State {
+    current_song: Option<Song>,
+    mpd_status: MpdStatus,
+    img_state: ImgState,
+}
+
+struct App {
     client: MpdClient,
     font: Font,
-    state: State<'a>,
+    state: State,
     last_update_time: Option<Instant>,
     exit: bool,
 }
 
-impl App<'_> {
+impl App {
     const UPDATE_PERIOD: Duration = Duration::from_secs(1);
     const ALPHABET: &'static str = include_str!("../alphabets/alphabet.txt");
     const BDF_FILE: &'static str = include_str!("../fonts/bitocra-13.bdf");
@@ -84,7 +128,7 @@ impl App<'_> {
     }
 
     pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
-        let _ = self.update_current_song()?;
+        let _ = self.update_app_state()?;
         terminal.draw(|frame| self.render_frame(frame))?;
         while !self.exit {
             self.handle_events()?;
@@ -111,7 +155,7 @@ impl App<'_> {
                 };
             }
             if self.elapsed_since_update() >= Self::UPDATE_PERIOD {
-                self.update_current_song()?;
+                self.update_app_state()?;
                 break;
             }
         }
@@ -125,7 +169,7 @@ impl App<'_> {
         }
     }
 
-    fn update_current_song(&mut self) -> Result<()> {
+    fn update_app_state(&mut self) -> Result<()> {
         self.state.mpd_status = self.client.status()?;
         let song = self.client.currentsong()?;
         let song_changed = match (&song, &self.state.current_song) {
@@ -134,22 +178,40 @@ impl App<'_> {
             _ => true,
         };
 
-        if song_changed {
-            self.state.current_song = song;
-            self.state.img = self
-                .state
-                .current_song
-                .as_ref()
-                .map(|song| -> Result<DynamicImage> {
-                    let art = self.client.albumart(song)?;
-                    Ok(ImageReader::new(Cursor::new(art))
-                        .with_guessed_format()?
-                        .decode()?)
-                })
-                .transpose()?;
-            self.convert_img_to_colored_text()?;
-        }
+        self.state.current_song = song;
 
+        if song_changed && self.state.img_state.is_idle() {
+            // enter converting state
+            let art = self
+                .client
+                .albumart(self.state.current_song.as_ref().unwrap())?;
+            let font = self.font.clone();
+            let jh = std::thread::spawn(move || -> (DynamicImage, Text<'static>) {
+                let dyn_img = ImageReader::new(Cursor::new(art))
+                    .with_guessed_format()
+                    .unwrap()
+                    .decode()
+                    .unwrap();
+                let rows = convert::img_to_char_rows(
+                    &font,
+                    &LumaImage::from(&dyn_img),
+                    get_converter("direction-and-intensity"),
+                    Some(120),
+                    0.0,
+                    &get_conversion_algorithm("edge-augmented"),
+                );
+
+                let text = convert::char_rows_to_terminal_color_string(&rows, &dyn_img)
+                    .into_text()
+                    .unwrap();
+                (dyn_img, text)
+            });
+            self.state.img_state = ImgState::Converting(jh);
+        } else if self.state.img_state.is_idle() || self.state.img_state.is_working() {
+            // Nothing to do
+        } else {
+            self.state.img_state.finish_conversion();
+        }
         Ok(())
     }
 
@@ -187,43 +249,26 @@ impl App<'_> {
             MpdState::Play => "Playing",
             MpdState::Pause => "Paused",
         };
-        let times = status
-            .time
-            .as_ref()
-            .map(|(current, total)| format!("{} / {}", Self::fmt_duration(current), Self::fmt_duration(total)));
+        let times = status.time.as_ref().map(|(current, total)| {
+            format!(
+                "{} / {}",
+                Self::fmt_duration(current),
+                Self::fmt_duration(total)
+            )
+        });
 
         match times {
             Some(times) => format!("{} - {}", state, times),
-            None => state.to_string()
+            None => state.to_string(),
         }
     }
 
     fn exit(&mut self) {
         self.exit = true;
     }
-
-    fn convert_img_to_colored_text(&mut self) -> Result<()> {
-        self.state.colored_text = self.state.img.as_ref().map(|img| {
-            let rows = convert::img_to_char_rows(
-                &self.font,
-                &LumaImage::from(img),
-                // TODO: store these in App
-                get_converter("direction-and-intensity"),
-                Some(120),
-                0.0,
-                &get_conversion_algorithm("edge-augmented"),
-            );
-
-            convert::char_rows_to_terminal_color_string(&rows, img)
-        })
-            .as_deref()
-            .map(|str| str.into_text())
-            .transpose()?;
-        Ok(())
-    }
 }
 
-impl Widget for &App<'_> {
+impl Widget for &App {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let style = Style::default()
             .add_modifier(Modifier::REVERSED)
@@ -248,13 +293,13 @@ impl Widget for &App<'_> {
             .title(state_desc)
             .border_set(border::ROUNDED);
 
-        let no_image_text = Text::from("\n\n\nNo image");
-        let colored_text = self
-            .state
-            .colored_text
-            .as_ref()
-            .map(|text| text)
-            .unwrap_or(&no_image_text);
+        let no_image = Text::from("No image");
+        let converting_image = Text::from("Converting image");
+        let colored_text = match &self.state.img_state {
+            ImgState::Idle(Some((_, text))) => text,
+            ImgState::Idle(None) => &no_image,
+            ImgState::Converting(_) => &converting_image,
+        };
 
         let padding = Padding {
             left: 2,
