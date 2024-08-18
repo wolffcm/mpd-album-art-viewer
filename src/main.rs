@@ -1,4 +1,5 @@
 use ansi_to_tui::IntoText;
+use clap::Parser;
 use image::{io::Reader as ImageReader, DynamicImage};
 use img_to_ascii::{
     convert::{self, get_conversion_algorithm, get_converter},
@@ -27,15 +28,26 @@ use ratatui::{
     },
     Frame, Terminal,
 };
-use std::io::{stdout, Cursor};
-use std::net::SocketAddr;
+use std::{io::{stdout, Cursor}, net::ToSocketAddrs};
 use std::time::{Duration, Instant};
 use std::{error::Error, thread::JoinHandle};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[arg(long, value_name = "HOST", default_value = "localhost")]
+    host: String,
+    #[arg(long, value_name = "PORT", default_value_t = 6600)]
+    port: u16,
+}
+
 fn main() -> Result<()> {
-    let mut app = App::create()?;
+    let args = Args::parse();
+    let host_port = format!("{}:{}", args.host, args.port);
+
+    let mut app = App::create(&host_port)?;
 
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
@@ -114,8 +126,14 @@ impl App {
     const ALPHABET: &'static str = include_str!("../alphabets/alphabet.txt");
     const BDF_FILE: &'static str = include_str!("../fonts/bitocra-13.bdf");
 
-    pub fn create() -> Result<Self> {
-        let addr = SocketAddr::from(([127, 0, 0, 1], 6600));
+    pub fn create(host_port: &str) -> Result<Self> {
+        let mut addrs_iter = host_port.to_socket_addrs()?;
+        let addr = match  addrs_iter.next() {
+            None => return Err("could not resolve host".into()),
+            Some(addr) => addr,
+        };
+
+        
         let client = MpdClient::connect(addr)?;
         let alphabet = Self::ALPHABET.chars().collect::<Vec<char>>();
         let font = Font::from_bdf_stream(Self::BDF_FILE.as_bytes(), &alphabet);

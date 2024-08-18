@@ -1,5 +1,6 @@
 [package]
 name = "mpd-album-art-viewer"
+description = "An MPD client that displays ASCII album art for the currently playing song"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,6 +8,7 @@ edition = "2021"
 
 [dependencies]
 ansi-to-tui = "5.0.0-rc.1"
+clap = { version = "4.5.16", features = ["derive"] }
 image = "0.24.9"
 image-to-ascii = "0.6.0"
 mpd = "0.1.0"
