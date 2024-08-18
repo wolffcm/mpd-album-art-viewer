@@ -7,7 +7,7 @@ use img_to_ascii::{
     font::Font,
     image::LumaImage,
 };
-use log::{info, warn};
+use log::{debug, info, warn};
 use mpd::{
     client::Client as MpdClient, song::Song, status::State as MpdState, status::Status as MpdStatus,
 };
@@ -30,7 +30,7 @@ use ratatui::{
     },
     Frame, Terminal,
 };
-use std::{error::Error, thread::JoinHandle};
+use std::{error::Error, path::Path, thread::JoinHandle};
 use std::{
     io::{stdout, Cursor},
     net::ToSocketAddrs,
@@ -215,31 +215,44 @@ impl App {
         }
     }
 
+    fn songs_in_same_dir(song0: &Song, song1: &Song) -> bool {
+        let dir0 = Path::new(&song0.file).parent();
+        let dir1 = Path::new(&song1.file).parent();
+        debug!("songs_in_same_dir: {:?}, {:?}", dir0, dir1);
+        dir0 == dir1
+    }
+
     fn update_app_state(&mut self) -> Result<()> {
         self.state.mpd_status = self.client.status()?;
-        let song = self.client.currentsong()?;
-        let song_changed = match (&song, &self.state.current_song) {
-            (None, None) => false,
-            (Some(song0), Some(song1)) if song0 == song1 => false,
-            _ => true,
+        let old_song = self.state.current_song.take();
+        let new_song = self.client.currentsong()?;
+        let (song_changed, album_art_changed) = match (&old_song, &new_song) {
+            (None, None) => (false, false),
+            (Some(song0), Some(song1)) if song0 == song1 => (false, false),
+            (Some(song0), Some(song1)) => (true, !Self::songs_in_same_dir(song0, song1)),
+            _ => (true, true),
         };
 
-        self.state.current_song = song;
+        self.state.current_song = new_song;
 
-        if song_changed && self.state.img_state.is_idle() {
+        if song_changed {
+            debug!("song changed: {song_changed}; album_art_changed: {album_art_changed}");
+        }
+
+        if song_changed && self.state.img_state.is_idle() && album_art_changed {
             // enter converting state
-            let art: Option<Vec<u8>> = self
-                .state
-                .current_song
-                .as_ref()
-                .and_then(|song| -> Option<Vec<u8>> {
-                    self.client
-                        .albumart(song)
-                        .inspect_err(|err| {
-                            warn!("error fetching album art for \"{}\": {:?}", song.file, err)
-                        })
-                        .ok()
-                });
+            let art: Option<Vec<u8>> =
+                self.state
+                    .current_song
+                    .as_ref()
+                    .and_then(|song| -> Option<Vec<u8>> {
+                        self.client
+                            .albumart(song)
+                            .inspect_err(|err| {
+                                warn!("error fetching album art for \"{}\": {:?}", song.file, err)
+                            })
+                            .ok()
+                    });
 
             let font = self.font.clone();
             let width = (self.state.area.height as usize - 10) * 2;
