@@ -97,10 +97,7 @@ enum ImgState {
 
 impl ImgState {
     fn is_idle(&self) -> bool {
-        match self {
-            ImgState::Idle(_) => true,
-            _ => false,
-        }
+        matches!(self, ImgState::Idle(_))
     }
 
     fn is_working(&self) -> bool {
@@ -178,7 +175,7 @@ impl App {
     pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         self.state.area = terminal.get_frame().size();
 
-        let _ = self.update_app_state()?;
+        self.update_app_state()?;
         terminal.draw(|frame| self.render_frame(frame))?;
         while !self.exit {
             self.handle_events()?;
@@ -213,9 +210,8 @@ impl App {
     }
 
     fn handle_key_event(&mut self, key_event: KeyEvent) {
-        match key_event.code {
-            KeyCode::Char('q') => self.exit(),
-            _ => {}
+        if let KeyCode::Char('q') = key_event.code {
+            self.exit();
         }
     }
 
@@ -236,16 +232,21 @@ impl App {
                 .state
                 .current_song
                 .as_ref()
-                .map(|song| -> Option<Vec<u8>> { self.client.albumart(song)
-                    .inspect_err(|err| warn!("error fetching album art for {}: {:?}", song.file, err))
-                    .ok() })
-                .flatten();
+                .and_then(|song| -> Option<Vec<u8>> {
+                    self.client
+                        .albumart(song)
+                        .inspect_err(|err| {
+                            warn!("error fetching album art for \"{}\": {:?}", song.file, err)
+                        })
+                        .ok()
+                });
+
             let font = self.font.clone();
             let width = (self.state.area.height as usize - 10) * 2;
             let jh = std::thread::spawn(move || -> Option<(DynamicImage, Text<'static>)> {
                 let art = match art {
                     None => return None,
-                    Some(_art) => _art,
+                    Some(art) => art,
                 };
 
                 let dyn_img = ImageReader::new(Cursor::new(art))
