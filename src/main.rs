@@ -1,11 +1,13 @@
 use ansi_to_tui::IntoText;
 use clap::Parser;
+use core::str::FromStr;
 use image::{io::Reader as ImageReader, DynamicImage};
 use img_to_ascii::{
     convert::{self, get_conversion_algorithm, get_converter},
     font::Font,
     image::LumaImage,
 };
+use log::{info, warn};
 use mpd::{
     client::Client as MpdClient, song::Song, status::State as MpdState, status::Status as MpdStatus,
 };
@@ -28,9 +30,15 @@ use ratatui::{
     },
     Frame, Terminal,
 };
-use std::{io::{stdout, Cursor}, net::ToSocketAddrs};
-use std::time::{Duration, Instant};
 use std::{error::Error, thread::JoinHandle};
+use std::{
+    io::{stdout, Cursor},
+    net::ToSocketAddrs,
+};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -41,12 +49,34 @@ struct Args {
     host: String,
     #[arg(long, value_name = "PORT", default_value_t = 6600)]
     port: u16,
+    #[arg(long, value_name = "LEVEL", default_value = "WARN")]
+    log_level_filter: String,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let host_port = format!("{}:{}", args.host, args.port);
 
+    match std::env::var_os("XDG_STATE_HOME") {
+        None => (),
+        Some(xdg_state_home) => {
+            let mut log_path = PathBuf::from(xdg_state_home);
+            log_path.push(env!("CARGO_PKG_NAME"));
+            log_path.push("log");
+            let log_level_filter: log::LevelFilter =
+                log::LevelFilter::from_str(&args.log_level_filter)?;
+            match simple_logging::log_to_file(&log_path, log_level_filter) {
+                Ok(()) => Ok(()),
+                Err(err) => Err(format!(
+                    "error logging to {}: {:?}",
+                    log_path.display(),
+                    err
+                )),
+            }?;
+            info!(target: "default", "starting logging");
+        }
+    }
+
+    let host_port = format!("{}:{}", args.host, args.port);
     let mut app = App::create(&host_port)?;
 
     enable_raw_mode()?;
@@ -128,12 +158,11 @@ impl App {
 
     pub fn create(host_port: &str) -> Result<Self> {
         let mut addrs_iter = host_port.to_socket_addrs()?;
-        let addr = match  addrs_iter.next() {
+        let addr = match addrs_iter.next() {
             None => return Err("could not resolve host".into()),
             Some(addr) => addr,
         };
 
-        
         let client = MpdClient::connect(addr)?;
         let alphabet = Self::ALPHABET.chars().collect::<Vec<char>>();
         let font = Font::from_bdf_stream(Self::BDF_FILE.as_bytes(), &alphabet);
@@ -207,7 +236,9 @@ impl App {
                 .state
                 .current_song
                 .as_ref()
-                .map(|song| -> Option<Vec<u8>> { self.client.albumart(song).ok() })
+                .map(|song| -> Option<Vec<u8>> { self.client.albumart(song)
+                    .inspect_err(|err| warn!("error fetching album art for {}: {:?}", song.file, err))
+                    .ok() })
                 .flatten();
             let font = self.font.clone();
             let width = (self.state.area.height as usize - 10) * 2;
@@ -219,8 +250,10 @@ impl App {
 
                 let dyn_img = ImageReader::new(Cursor::new(art))
                     .with_guessed_format()
+                    .inspect_err(|err| warn!("error guessing image format: {:?}", err))
                     .ok()?
                     .decode()
+                    .inspect_err(|err| warn!("error decoding image: {:?}", err))
                     .ok()?;
                 let rows = convert::img_to_char_rows(
                     &font,
@@ -233,6 +266,7 @@ impl App {
 
                 let text = convert::char_rows_to_terminal_color_string(&rows, &dyn_img)
                     .into_text()
+                    .inspect_err(|err| warn!("error converting ANSI to `Text`: {:?}", err))
                     .ok()?;
                 Some((dyn_img, text))
             });
