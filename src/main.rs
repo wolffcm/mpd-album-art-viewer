@@ -51,6 +51,10 @@ struct Args {
     port: u16,
     #[arg(long, value_name = "LEVEL", default_value = "WARN")]
     log_level_filter: String,
+    #[arg(long, value_name = "PIXELS", default_value_t = 15.)]
+    font_height: f64,
+    #[arg(long, value_name = "PIXELS", default_value_t = 8.0)]
+    font_width: f64,
 }
 
 fn main() -> Result<()> {
@@ -77,7 +81,7 @@ fn main() -> Result<()> {
     }
 
     let host_port = format!("{}:{}", args.host, args.port);
-    let mut app = App::create(&host_port)?;
+    let mut app = App::create(&host_port, args.font_height.round() as usize, args.font_width.round() as usize)?;
 
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
@@ -161,7 +165,7 @@ impl App {
     const ALPHABET: &'static str = include_str!("../alphabets/alphabet.txt");
     const BDF_FILE: &'static str = include_str!("../fonts/bitocra-13.bdf");
 
-    pub fn create(host_port: &str) -> Result<Self> {
+    pub fn create(host_port: &str, font_height: usize, font_width: usize) -> Result<Self> {
         let mut addrs_iter = host_port.to_socket_addrs()?;
         let addr = match addrs_iter.next() {
             None => return Err("could not resolve host".into()),
@@ -170,7 +174,10 @@ impl App {
 
         let client = MpdClient::connect(addr)?;
         let alphabet = Self::ALPHABET.chars().collect::<Vec<char>>();
-        let font = Font::from_bdf_stream(Self::BDF_FILE.as_bytes(), &alphabet);
+        let mut font = Font::from_bdf_stream(Self::BDF_FILE.as_bytes(), &alphabet);
+        font.height = font_height;
+        font.width = font_width;
+
         let font_aspect = font.width as f64 / font.height as f64;
         info!(
             "font has width {} and height {}; aspect: {}",
@@ -255,6 +262,7 @@ impl App {
 
         if song_changed && self.state.img_state.is_idle() && album_art_changed {
             // enter converting state
+            let start_album_art = Instant::now();
             let art: Option<Vec<u8>> =
                 self.state
                     .current_song
@@ -267,6 +275,7 @@ impl App {
                             })
                             .ok()
                     });
+            info!("fetching album art took {:?}", start_album_art.elapsed());
 
             let font = self.font.clone();
             let font_aspect = self.font_aspect;
