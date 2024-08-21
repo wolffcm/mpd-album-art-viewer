@@ -134,7 +134,7 @@ impl Default for ImgState {
 
 #[derive(Default)]
 struct State {
-    area: Rect,
+    viewport_area: Rect,
     current_song: Option<Song>,
     mpd_status: MpdStatus,
     img_state: ImgState,
@@ -143,10 +143,18 @@ struct State {
 struct App {
     client: MpdClient,
     font: Font,
+    font_aspect: f64,
     state: State,
     last_update_time: Option<Instant>,
     exit: bool,
 }
+
+const HORIZ_BORDER_WIDTH: usize = 1;
+const VERT_BORDER_WIDTH: usize = 1;
+const HORIZ_PADDING: usize = 2;
+const VERT_PADDING: usize = 1;
+const HORIZ_VIEWPORT_GAP: usize = 6;
+const VERT_VIEWPORT_GAP: usize = 3;
 
 impl App {
     const UPDATE_PERIOD: Duration = Duration::from_secs(1);
@@ -163,8 +171,14 @@ impl App {
         let client = MpdClient::connect(addr)?;
         let alphabet = Self::ALPHABET.chars().collect::<Vec<char>>();
         let font = Font::from_bdf_stream(Self::BDF_FILE.as_bytes(), &alphabet);
+        let font_aspect = font.width as f64 / font.height as f64;
+        info!(
+            "font has width {} and height {}; aspect: {}",
+            font.width, font.height, font_aspect
+        );
         Ok(App {
             font,
+            font_aspect,
             client,
             state: State::default(),
             last_update_time: None,
@@ -173,7 +187,7 @@ impl App {
     }
 
     pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
-        self.state.area = terminal.get_frame().size();
+        self.state.viewport_area = terminal.get_frame().size();
 
         self.update_app_state()?;
         terminal.draw(|frame| self.render_frame(frame))?;
@@ -255,7 +269,8 @@ impl App {
                     });
 
             let font = self.font.clone();
-            let width = (self.state.area.height as usize - 10) * 2;
+            let font_aspect = self.font_aspect;
+            let area = self.state.viewport_area;
             let jh = std::thread::spawn(move || -> Option<(DynamicImage, Text<'static>)> {
                 let art = match art {
                     None => return None,
@@ -269,6 +284,42 @@ impl App {
                     .decode()
                     .inspect_err(|err| warn!("error decoding image: {:?}", err))
                     .ok()?;
+                let viewable_width = area.width as usize
+                    - (HORIZ_VIEWPORT_GAP + HORIZ_BORDER_WIDTH + HORIZ_PADDING) * 2;
+                let viewable_height = area.height as usize
+                    - (VERT_VIEWPORT_GAP + VERT_BORDER_WIDTH + VERT_PADDING) * 2;
+                let viewport_aspect = viewable_width as f64 * font_aspect / viewable_height as f64;
+                let image_aspect = dyn_img.width() as f64 / dyn_img.height() as f64;
+                info!("viewport: {}; aspect: {}", area, viewport_aspect);
+                info!(
+                    "image: {} x {}; aspect: {}",
+                    dyn_img.width(),
+                    dyn_img.height(),
+                    image_aspect
+                );
+                let width = if image_aspect > viewport_aspect {
+                    // Image is wide compared to the viewport, so width will be the determining
+                    // factor when scaling.
+                    area.width as usize
+                        - (HORIZ_VIEWPORT_GAP + HORIZ_BORDER_WIDTH + HORIZ_PADDING) * 2
+                } else {
+                    // Image is tall compared to the viewport, so height will be the determining
+                    // factor when scaling.
+                    //
+                    // (VERT_VIEWPORT_GAP + VERT_BORDER_WIDTH + VERT_PADDING) * 2 + ascii_img_width * font_aspect / img_aspect ==
+                    //   viewport_height
+                    //
+                    // ascii_img_height == ascii_img_width * font_aspect / img_aspect
+                    // Solving for width:
+                    //
+                    // width = (viewport_height - ((VERT_VIEWPORT_GAP + VERT_BORDER_WIDTH + VERT_PADDING) * 2)) / font_aspect;
+                    ((area.height as usize
+                        - ((VERT_VIEWPORT_GAP + VERT_BORDER_WIDTH + VERT_PADDING) * 2))
+                        as f64
+                        * image_aspect
+                        / font_aspect) as usize
+                };
+                info!("scaled ascii image width: {}", width);
                 let rows = convert::img_to_char_rows(
                     &font,
                     &LumaImage::from(&dyn_img),
@@ -277,6 +328,20 @@ impl App {
                     0.0,
                     &get_conversion_algorithm("edge-augmented"),
                 );
+                {
+                    let converted_width = rows[0].len();
+                    let converted_height = rows.len();
+                    let aspect0 = converted_width as f64 / converted_height as f64;
+                    let aspect1 = converted_height as f64 / converted_width as f64;
+
+                    info!(
+                        "converted image is {} x {}; aspect {} or {}",
+                        rows[0].len(),
+                        rows.len(),
+                        aspect0,
+                        aspect1
+                    );
+                }
 
                 let text = convert::char_rows_to_terminal_color_string(&rows, &dyn_img)
                     .into_text()
@@ -344,6 +409,44 @@ impl App {
     fn exit(&mut self) {
         self.exit = true;
     }
+
+    fn create_paragraph(&self, buf: &mut Buffer, viewport_area: Rect, block: Block, text: &Text) {
+        let (width, height, vert_padding) = if text.height() > 1 {
+            // This is an image
+            let width = (text.width() + (HORIZ_BORDER_WIDTH + HORIZ_PADDING) * 2) as u16;
+            let height = (text.height() + (VERT_BORDER_WIDTH + VERT_PADDING) * 2) as u16;
+            (width, height, VERT_PADDING)
+        } else {
+            // This is a message
+            let viewable_width = viewport_area.width as usize - HORIZ_VIEWPORT_GAP * 2;
+            let viewable_height = viewport_area.height as usize - VERT_VIEWPORT_GAP * 2;
+            let viewport_aspect = viewable_width as f64 * self.font_aspect / viewable_height as f64;
+            if viewport_aspect < 1.0 {
+                // Taller than it is wide; use width to form a square.
+                let width = viewable_width as u16;
+                let height = (width as f64 * self.font_aspect) as u16;
+                (width, height, viewable_height / 2 - VERT_BORDER_WIDTH - 2)
+            } else {
+                // Wider than it is tall; Use height to form a square
+                let height = viewable_height as u16;
+                let width = (height as f64 / self.font_aspect) as u16;
+                (width, height, viewable_height / 2 - VERT_BORDER_WIDTH - 2)
+            }
+        };
+        let area = Rect {
+            width,
+            height,
+            x: (viewport_area.width - width) / 2,
+            y: (viewport_area.height - height) / 2,
+        };
+
+        let padding = Padding::symmetric(HORIZ_PADDING as u16, vert_padding as u16);
+
+        Paragraph::new(text.clone())
+            .centered()
+            .block(block.padding(padding))
+            .render(area, buf);
+    }
 }
 
 impl Widget for &App {
@@ -381,27 +484,6 @@ impl Widget for &App {
             ImgState::Converting(_) => &converting_image,
         };
 
-        let width: u16 = (area.height - 10) * 2;
-        let height: u16 = area.height - 10;
-        let area = Rect {
-            width,
-            height,
-            x: (area.width - width) / 2,
-            y: (area.height - height) / 2,
-        };
-
-        let padding = Padding::symmetric(
-            2,
-            if colored_text.height() > 1 {
-                1
-            } else {
-                height / 2 - 3
-            },
-        );
-
-        Paragraph::new(colored_text.clone())
-            .centered()
-            .block(block.padding(padding))
-            .render(area, buf);
+        self.create_paragraph(buf, area, block, &colored_text);
     }
 }
