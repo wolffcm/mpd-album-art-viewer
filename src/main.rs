@@ -81,7 +81,11 @@ fn main() -> Result<()> {
     }
 
     let host_port = format!("{}:{}", args.host, args.port);
-    let mut app = App::create(&host_port, args.font_height.round() as usize, args.font_width.round() as usize)?;
+    let mut app = App::create(
+        &host_port,
+        args.font_height.round() as usize,
+        args.font_width.round() as usize,
+    )?;
 
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
@@ -96,37 +100,156 @@ fn main() -> Result<()> {
 
 enum ImgState {
     Idle(Option<(DynamicImage, Text<'static>)>),
+    Fetching(JoinHandle<(MpdClient, Option<Vec<u8>>)>),
     Converting(JoinHandle<Option<(DynamicImage, Text<'static>)>>),
 }
 
+impl std::fmt::Debug for ImgState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Idle(_) => f.debug_tuple("Idle").finish(),
+            Self::Fetching(_) => f.debug_tuple("Fetching").finish(),
+            Self::Converting(_) => f.debug_tuple("Converting").finish(),
+        }
+    }
+}
+
 impl ImgState {
-    fn is_idle(&self) -> bool {
-        matches!(self, ImgState::Idle(_))
+    fn is_fetching(&self) -> bool {
+        matches!(self, ImgState::Fetching(_))
     }
 
-    fn is_working(&self) -> bool {
+    fn is_converting(&self) -> bool {
+        matches!(self, ImgState::Converting(_))
+    }
+
+    fn set_idle(&mut self, st: Option<(DynamicImage, Text<'static>)>) {
+        info!("setting idle");
+        *self = ImgState::Idle(st)
+    }
+
+    fn start_fetching(&mut self, mut client: MpdClient, song: Option<Song>) {
+        info!("starting fetching of {:?}", song);
+        let jh = std::thread::spawn(move || -> (MpdClient, Option<Vec<u8>>) {
+            let start_album_art = Instant::now();
+            let art: Option<Vec<u8>> = song.as_ref().and_then(|song| -> Option<Vec<u8>> {
+                client
+                    .albumart(song)
+                    .inspect_err(|err| {
+                        warn!("error fetching album art for \"{}\": {:?}", song.file, err)
+                    })
+                    .ok()
+            });
+            info!("fetching album art took {:?}", start_album_art.elapsed());
+            (client, art)
+        });
+        *self = ImgState::Fetching(jh);
+    }
+
+    fn try_finish_fetching(&mut self) -> Option<(MpdClient, Option<Vec<u8>>)> {
         match self {
-            ImgState::Idle(_) => false,
-            ImgState::Converting(jh) => !jh.is_finished(),
+            ImgState::Fetching(jh) if jh.is_finished() => (),
+            _ => return None,
+        }
+
+        info!("fetching done");
+        let mut tmp = ImgState::default();
+        std::mem::swap(&mut tmp, self);
+
+        match tmp {
+            ImgState::Fetching(jh) if jh.is_finished() => {
+                let (client, bytes) = jh.join().expect("why would it not join");
+                Some((client, bytes))
+            }
+            _ => unreachable!(),
         }
     }
 
-    fn finish_conversion(&mut self) {
+    fn start_converting(&mut self, bytes: Vec<u8>, conv_ctx: ConversionContext) {
+        info!("starting converting");
+        let jh = std::thread::spawn(move || -> Option<(DynamicImage, Text<'static>)> {
+            let dyn_img = ImageReader::new(Cursor::new(bytes))
+                .with_guessed_format()
+                .inspect_err(|err| warn!("error guessing image format: {:?}", err))
+                .ok()?
+                .decode()
+                .inspect_err(|err| warn!("error decoding image: {:?}", err))
+                .ok()?;
+            let viewable_width = conv_ctx.area.width as usize
+                - (HORIZ_VIEWPORT_GAP + HORIZ_BORDER_WIDTH + HORIZ_PADDING) * 2;
+            let viewable_height = conv_ctx.area.height as usize
+                - (VERT_VIEWPORT_GAP + VERT_BORDER_WIDTH + VERT_PADDING) * 2;
+            let viewport_aspect =
+                viewable_width as f64 * conv_ctx.font_aspect / viewable_height as f64;
+            let image_aspect = dyn_img.width() as f64 / dyn_img.height() as f64;
+            info!("viewport: {}; aspect: {}", conv_ctx.area, viewport_aspect);
+            info!(
+                "image: {} x {}; aspect: {}",
+                dyn_img.width(),
+                dyn_img.height(),
+                image_aspect
+            );
+            let width = if image_aspect > viewport_aspect {
+                // Image is wide compared to the viewport, so width will be the determining
+                // factor when scaling.
+                conv_ctx.area.width as usize
+                    - (HORIZ_VIEWPORT_GAP + HORIZ_BORDER_WIDTH + HORIZ_PADDING) * 2
+            } else {
+                // Image is tall compared to the viewport, so height will be the determining
+                // factor when scaling.
+                //
+                // (VERT_VIEWPORT_GAP + VERT_BORDER_WIDTH + VERT_PADDING) * 2 + ascii_img_width * font_aspect / img_aspect ==
+                //   viewport_height
+                //
+                // ascii_img_height == ascii_img_width * font_aspect / img_aspect
+                // Solving for width:
+                //
+                // width = (viewport_height - ((VERT_VIEWPORT_GAP + VERT_BORDER_WIDTH + VERT_PADDING) * 2)) / font_aspect;
+                ((conv_ctx.area.height as usize
+                    - ((VERT_VIEWPORT_GAP + VERT_BORDER_WIDTH + VERT_PADDING) * 2))
+                    as f64
+                    * image_aspect
+                    / conv_ctx.font_aspect) as usize
+            };
+            info!("scaled ascii image width: {}", width);
+            let rows = convert::img_to_char_rows(
+                &conv_ctx.font,
+                &LumaImage::from(&dyn_img),
+                get_converter("direction-and-intensity"),
+                Some(width),
+                0.0,
+                &get_conversion_algorithm("edge-augmented"),
+            );
+            let text = convert::char_rows_to_terminal_color_string(&rows, &dyn_img)
+                .into_text()
+                .inspect_err(|err| warn!("error converting ANSI to `Text`: {:?}", err))
+                .ok()?;
+            Some((dyn_img, text))
+        });
+        *self = ImgState::Converting(jh)
+    }
+
+    fn try_finish_converting(&mut self) -> Option<(DynamicImage, Text<'static>)> {
+        match self {
+            ImgState::Converting(jh) if jh.is_finished() => (),
+            _ => return None,
+        };
+
+        info!("finishing converting");
         let mut tmp = ImgState::default();
         std::mem::swap(&mut tmp, self);
 
         let jh = match tmp {
-            ImgState::Idle(_) => panic!("not converting"),
             ImgState::Converting(jh) => {
                 assert!(jh.is_finished());
                 jh
             }
+            _ => unreachable!(),
         };
 
-        match jh.join() {
-            Err(err) => panic!("{:?}", err),
-            Ok(converted) => *self = ImgState::Idle(converted),
-        }
+        jh.join()
+            .inspect_err(|err| warn!("error joining converting thread: {:?}", err))
+            .ok()?
     }
 }
 
@@ -134,6 +257,12 @@ impl Default for ImgState {
     fn default() -> Self {
         Self::Idle(None)
     }
+}
+
+struct ConversionContext {
+    area: Rect,
+    font: Font,
+    font_aspect: f64,
 }
 
 #[derive(Default)]
@@ -145,7 +274,7 @@ struct State {
 }
 
 struct App {
-    client: MpdClient,
+    client: Option<MpdClient>,
     font: Font,
     font_aspect: f64,
     state: State,
@@ -153,12 +282,13 @@ struct App {
     exit: bool,
 }
 
-const HORIZ_BORDER_WIDTH: usize = 1;
-const VERT_BORDER_WIDTH: usize = 1;
-const HORIZ_PADDING: usize = 2;
-const VERT_PADDING: usize = 1;
-const HORIZ_VIEWPORT_GAP: usize = 6;
 const VERT_VIEWPORT_GAP: usize = 3;
+const VERT_BORDER_WIDTH: usize = 1;
+const VERT_PADDING: usize = 1;
+
+const HORIZ_VIEWPORT_GAP: usize = 6;
+const HORIZ_BORDER_WIDTH: usize = 1;
+const HORIZ_PADDING: usize = 2;
 
 impl App {
     const UPDATE_PERIOD: Duration = Duration::from_secs(1);
@@ -172,7 +302,7 @@ impl App {
             Some(addr) => addr,
         };
 
-        let client = MpdClient::connect(addr)?;
+        let client = Some(MpdClient::connect(addr)?);
         let alphabet = Self::ALPHABET.chars().collect::<Vec<char>>();
         let mut font = Font::from_bdf_stream(Self::BDF_FILE.as_bytes(), &alphabet);
         font.height = font_height;
@@ -244,125 +374,55 @@ impl App {
     }
 
     fn update_app_state(&mut self) -> Result<()> {
-        self.state.mpd_status = self.client.status()?;
+        let mut new_img_bytes = None;
+        if self.client.is_none() {
+            assert!(self.state.img_state.is_fetching());
+            match self.state.img_state.try_finish_fetching() {
+                None => {
+                    // Blocked waiting for image download
+                    return Ok(());
+                }
+                Some((client, new_bytes)) => {
+                    self.state.img_state.set_idle(None);
+                    new_img_bytes = new_bytes;
+                    self.client = Some(client);
+                }
+            }
+        }
+
+        let client = self.client.as_mut().unwrap();
+        self.state.mpd_status = client.status()?;
         let old_song = self.state.current_song.take();
-        let new_song = self.client.currentsong()?;
-        let (song_changed, album_art_changed) = match (&old_song, &new_song) {
-            (None, None) => (false, false),
-            (Some(song0), Some(song1)) if song0 == song1 => (false, false),
-            (Some(song0), Some(song1)) => (true, !Self::songs_in_same_dir(song0, song1)),
-            _ => (true, true),
+        let new_song = client.currentsong()?;
+        let album_art_changed = match (&old_song, &new_song) {
+            (None, None) => false,
+            (Some(song0), Some(song1)) if song0 == song1 => false,
+            (Some(song0), Some(song1)) => !Self::songs_in_same_dir(song0, song1),
+            _ => true,
         };
 
         self.state.current_song = new_song;
-
-        if song_changed {
-            debug!("song changed: {song_changed}; album_art_changed: {album_art_changed}");
-        }
-
-        if song_changed && self.state.img_state.is_idle() && album_art_changed {
-            // enter converting state
-            let start_album_art = Instant::now();
-            let art: Option<Vec<u8>> =
-                self.state
-                    .current_song
-                    .as_ref()
-                    .and_then(|song| -> Option<Vec<u8>> {
-                        self.client
-                            .albumart(song)
-                            .inspect_err(|err| {
-                                warn!("error fetching album art for \"{}\": {:?}", song.file, err)
-                            })
-                            .ok()
-                    });
-            info!("fetching album art took {:?}", start_album_art.elapsed());
-
-            let font = self.font.clone();
-            let font_aspect = self.font_aspect;
-            let area = self.state.viewport_area;
-            let jh = std::thread::spawn(move || -> Option<(DynamicImage, Text<'static>)> {
-                let art = match art {
-                    None => return None,
-                    Some(art) => art,
-                };
-
-                let dyn_img = ImageReader::new(Cursor::new(art))
-                    .with_guessed_format()
-                    .inspect_err(|err| warn!("error guessing image format: {:?}", err))
-                    .ok()?
-                    .decode()
-                    .inspect_err(|err| warn!("error decoding image: {:?}", err))
-                    .ok()?;
-                let viewable_width = area.width as usize
-                    - (HORIZ_VIEWPORT_GAP + HORIZ_BORDER_WIDTH + HORIZ_PADDING) * 2;
-                let viewable_height = area.height as usize
-                    - (VERT_VIEWPORT_GAP + VERT_BORDER_WIDTH + VERT_PADDING) * 2;
-                let viewport_aspect = viewable_width as f64 * font_aspect / viewable_height as f64;
-                let image_aspect = dyn_img.width() as f64 / dyn_img.height() as f64;
-                info!("viewport: {}; aspect: {}", area, viewport_aspect);
-                info!(
-                    "image: {} x {}; aspect: {}",
-                    dyn_img.width(),
-                    dyn_img.height(),
-                    image_aspect
-                );
-                let width = if image_aspect > viewport_aspect {
-                    // Image is wide compared to the viewport, so width will be the determining
-                    // factor when scaling.
-                    area.width as usize
-                        - (HORIZ_VIEWPORT_GAP + HORIZ_BORDER_WIDTH + HORIZ_PADDING) * 2
-                } else {
-                    // Image is tall compared to the viewport, so height will be the determining
-                    // factor when scaling.
-                    //
-                    // (VERT_VIEWPORT_GAP + VERT_BORDER_WIDTH + VERT_PADDING) * 2 + ascii_img_width * font_aspect / img_aspect ==
-                    //   viewport_height
-                    //
-                    // ascii_img_height == ascii_img_width * font_aspect / img_aspect
-                    // Solving for width:
-                    //
-                    // width = (viewport_height - ((VERT_VIEWPORT_GAP + VERT_BORDER_WIDTH + VERT_PADDING) * 2)) / font_aspect;
-                    ((area.height as usize
-                        - ((VERT_VIEWPORT_GAP + VERT_BORDER_WIDTH + VERT_PADDING) * 2))
-                        as f64
-                        * image_aspect
-                        / font_aspect) as usize
-                };
-                info!("scaled ascii image width: {}", width);
-                let rows = convert::img_to_char_rows(
-                    &font,
-                    &LumaImage::from(&dyn_img),
-                    get_converter("direction-and-intensity"),
-                    Some(width),
-                    0.0,
-                    &get_conversion_algorithm("edge-augmented"),
-                );
-                {
-                    let converted_width = rows[0].len();
-                    let converted_height = rows.len();
-                    let aspect0 = converted_width as f64 / converted_height as f64;
-                    let aspect1 = converted_height as f64 / converted_width as f64;
-
-                    info!(
-                        "converted image is {} x {}; aspect {} or {}",
-                        rows[0].len(),
-                        rows.len(),
-                        aspect0,
-                        aspect1
-                    );
-                }
-
-                let text = convert::char_rows_to_terminal_color_string(&rows, &dyn_img)
-                    .into_text()
-                    .inspect_err(|err| warn!("error converting ANSI to `Text`: {:?}", err))
-                    .ok()?;
-                Some((dyn_img, text))
-            });
-            self.state.img_state = ImgState::Converting(jh);
-        } else if self.state.img_state.is_idle() || self.state.img_state.is_working() {
-            // Nothing to do
-        } else {
-            self.state.img_state.finish_conversion();
+        if album_art_changed {
+            debug!("album_art_changed!");
+            // drop the image bytes, if any, that we just fetched.
+            new_img_bytes.take();
+            self.state
+                .img_state
+                .start_fetching(self.client.take().unwrap(), self.state.current_song.clone());
+        } else if new_img_bytes.is_some() {
+            self.state.img_state.start_converting(
+                new_img_bytes.unwrap(),
+                ConversionContext {
+                    area: self.state.viewport_area,
+                    font: self.font.clone(),
+                    font_aspect: self.font_aspect,
+                },
+            );
+        } else if self.state.img_state.is_converting() {
+            match self.state.img_state.try_finish_converting() {
+                v @ Some(_) => self.state.img_state.set_idle(v),
+                None => (),
+            }
         }
         Ok(())
     }
@@ -434,7 +494,7 @@ impl App {
                 // Taller than it is wide; use width to form a square.
                 let width = viewable_width as u16;
                 let height = (width as f64 * self.font_aspect) as u16;
-                (width, height, viewable_height / 2 - VERT_BORDER_WIDTH - 2)
+                (width, height, (height as usize - 2 * VERT_BORDER_WIDTH - 1) / 2)
             } else {
                 // Wider than it is tall; Use height to form a square
                 let height = viewable_height as u16;
@@ -442,6 +502,7 @@ impl App {
                 (width, height, viewable_height / 2 - VERT_BORDER_WIDTH - 2)
             }
         };
+
         let area = Rect {
             width,
             height,
@@ -487,12 +548,14 @@ impl Widget for &App {
         let no_img_style = Style::default().add_modifier(Modifier::DIM);
         let no_image: Text<'static> = Span::styled("No image", no_img_style).into();
         let converting_image: Text<'static> = Span::styled("Converting image", no_img_style).into();
+        let fetching_image: Text<'static> = Span::styled("Fetching image", no_img_style).into();
         let colored_text = match &self.state.img_state {
             ImgState::Idle(Some((_, text))) => text,
             ImgState::Idle(None) => &no_image,
+            ImgState::Fetching(_) => &fetching_image,
             ImgState::Converting(_) => &converting_image,
         };
 
-        self.create_paragraph(buf, area, block, &colored_text);
+        self.create_paragraph(buf, area, block, colored_text);
     }
 }
